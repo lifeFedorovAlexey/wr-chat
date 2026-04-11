@@ -1,0 +1,18 @@
+{
+  "name": "wr-chat",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Realtime chat service for Wild Rift All Stats",
+  "scripts": {
+    "start": "node ./server.mjs",
+    "dev": "node --watch ./server.mjs",
+    "test": "node --test ./test",
+    "lint": "eslint ."
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.2.0",
+    "globals": "^17.4.0"
+  }
+}
