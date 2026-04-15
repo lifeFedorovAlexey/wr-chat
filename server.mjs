@@ -1,25 +1,48 @@
 import http from "node:http";
+import { readConfig } from "./lib/config.mjs";
 
-const port = Number(process.env.PORT || 3400);
-const host = process.env.HOST || "127.0.0.1";
+const config = readConfig(process.env);
 
-const server = http.createServer((req, res) => {
-  if (req.url === "/health") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(
-      JSON.stringify({
-        ok: true,
-        service: "wr-chat",
-        version: "0.1.0",
-      }),
-    );
-    return;
+function setJsonHeaders(res) {
+  res.setHeader("Content-Type", "application/json; charset=utf-8");
+  res.setHeader("Cache-Control", "no-store");
+}
+
+function sendJson(res, statusCode, payload) {
+  setJsonHeaders(res);
+  res.statusCode = statusCode;
+  res.end(JSON.stringify(payload));
+}
+
+function handleRequest(req, res) {
+  const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+
+  if (req.method === "GET" && url.pathname === "/health") {
+    return sendJson(res, 200, {
+      ok: true,
+      service: config.serviceName,
+      version: config.version,
+      nodeEnv: config.nodeEnv,
+      wrApiOrigin: config.wrApiOrigin,
+      timestamp: new Date().toISOString(),
+    });
   }
 
-  res.writeHead(404, { "Content-Type": "application/json" });
-  res.end(JSON.stringify({ error: "Not Found" }));
-});
+  if (req.method === "GET" && url.pathname === "/") {
+    return sendJson(res, 200, {
+      service: config.serviceName,
+      status: "ready",
+      message: "wr-chat phase 1 scaffold is running",
+    });
+  }
 
-server.listen(port, host, () => {
-  console.log(`wr-chat listening on http://${host}:${port}`);
+  return sendJson(res, 404, {
+    error: "not_found",
+  });
+}
+
+const server = http.createServer(handleRequest);
+
+server.listen(config.port, config.host, () => {
+  console.log("[wr-chat] server started");
 });
