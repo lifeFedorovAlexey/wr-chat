@@ -60,3 +60,63 @@ test("websocket upgrade accepts valid session token and sends ready event", asyn
     }
   }
 });
+
+test("websocket upgrade rejects disallowed browser origins", async () => {
+  const previousSecret = process.env.WR_CHAT_SHARED_SECRET;
+  const previousAllowedOrigins = process.env.WR_CHAT_ALLOWED_ORIGINS;
+  process.env.WR_CHAT_SHARED_SECRET = TEST_ENV.WR_CHAT_SHARED_SECRET;
+  process.env.WR_CHAT_ALLOWED_ORIGINS = "https://allowed.example";
+
+  const { server } = createAppServer();
+
+  try {
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    const port = typeof address === "object" && address ? address.port : 0;
+    const sessionToken = createSignedChatSessionToken(
+      {
+        sub: "123",
+        displayName: "Life",
+        avatarUrl: "",
+        roles: ["user"],
+        exp: Date.now() + getChatSessionTtlMs(),
+      },
+      TEST_ENV,
+    );
+
+    await new Promise((resolve, reject) => {
+      const ws = new WebSocket(
+        `ws://127.0.0.1:${port}/ws?sessionToken=${encodeURIComponent(sessionToken)}`,
+        {
+          headers: {
+            Origin: "https://evil.example",
+          },
+        },
+      );
+
+      ws.on("open", () => reject(new Error("unexpected_ws_open")));
+      ws.on("error", (error) => {
+        try {
+          assert.match(error.message, /Unexpected server response: 403/);
+          resolve();
+        } catch (assertionError) {
+          reject(assertionError);
+        }
+      });
+    });
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+
+    if (previousSecret == null) {
+      delete process.env.WR_CHAT_SHARED_SECRET;
+    } else {
+      process.env.WR_CHAT_SHARED_SECRET = previousSecret;
+    }
+
+    if (previousAllowedOrigins == null) {
+      delete process.env.WR_CHAT_ALLOWED_ORIGINS;
+    } else {
+      process.env.WR_CHAT_ALLOWED_ORIGINS = previousAllowedOrigins;
+    }
+  }
+});

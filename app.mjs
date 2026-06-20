@@ -7,11 +7,28 @@ import {
   verifyChatSessionToken,
   verifySignedChatExchangeEnvelope,
 } from "./lib/chatAuth.mjs";
-import { persistChatMessage } from "./lib/wrApiClient.mjs";
+import { authorizeChatChannelAccess, persistChatMessage } from "./lib/wrApiClient.mjs";
 
 function sendJson(res, statusCode, payload) {
   res.writeHead(statusCode, { "Content-Type": "application/json" });
   res.end(JSON.stringify(payload));
+}
+
+function getAllowedOrigins(env = process.env) {
+  return String(env.WR_CHAT_ALLOWED_ORIGINS || "")
+    .split(",")
+    .map((origin) => origin.trim().replace(/\/+$/, ""))
+    .filter(Boolean);
+}
+
+function isWebSocketOriginAllowed(request, env = process.env) {
+  const allowedOrigins = getAllowedOrigins(env);
+  if (!allowedOrigins.length) {
+    return true;
+  }
+
+  const origin = String(request.headers.origin || "").trim().replace(/\/+$/, "");
+  return Boolean(origin && allowedOrigins.includes(origin));
 }
 
 async function readJsonBody(req) {
@@ -192,6 +209,22 @@ async function handleSocketMessage(ws, runtime, clientId, rawMessage) {
     }
 
     if ((type === "channel:join" || type === "channel:leave") && message.channelId) {
+      if (type === "channel:join") {
+        const client = runtime.getClient(clientId);
+        if (!client) {
+          ws.send(JSON.stringify({ type: "error", error: "room_registry_failed" }));
+          return;
+        }
+
+        await authorizeChatChannelAccess(
+          {
+            userId: Number(client.session.user.id),
+            channelId: message.channelId,
+          },
+          process.env,
+        );
+      }
+
       const result =
         type === "channel:join"
           ? runtime.joinRoom(clientId, message.channelId)
@@ -359,6 +392,12 @@ export function createAppServer() {
       const url = new URL(request.url || "/", "http://localhost");
       if (url.pathname !== "/ws") {
         socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
+        socket.destroy();
+        return;
+      }
+
+      if (!isWebSocketOriginAllowed(request, process.env)) {
+        socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
         socket.destroy();
         return;
       }

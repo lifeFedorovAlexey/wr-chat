@@ -27,7 +27,16 @@ function createToken(userId) {
 
 test("channel join and leave update in-memory room membership", async () => {
   const previousSecret = process.env.WR_CHAT_SHARED_SECRET;
+  const previousApiOrigin = process.env.WR_API_ORIGIN;
+  const previousFetch = global.fetch;
   process.env.WR_CHAT_SHARED_SECRET = TEST_ENV.WR_CHAT_SHARED_SECRET;
+  process.env.WR_API_ORIGIN = "http://wr-api.local";
+  global.fetch = async () => ({
+    ok: true,
+    async json() {
+      return { ok: true };
+    },
+  });
 
   const { server, runtime } = createAppServer();
 
@@ -84,5 +93,80 @@ test("channel join and leave update in-memory room membership", async () => {
     } else {
       process.env.WR_CHAT_SHARED_SECRET = previousSecret;
     }
+
+    if (previousApiOrigin == null) {
+      delete process.env.WR_API_ORIGIN;
+    } else {
+      process.env.WR_API_ORIGIN = previousApiOrigin;
+    }
+
+    global.fetch = previousFetch;
+  }
+});
+
+test("channel join is rejected when wr-api denies access", async () => {
+  const previousSecret = process.env.WR_CHAT_SHARED_SECRET;
+  const previousApiOrigin = process.env.WR_API_ORIGIN;
+  const previousFetch = global.fetch;
+  process.env.WR_CHAT_SHARED_SECRET = TEST_ENV.WR_CHAT_SHARED_SECRET;
+  process.env.WR_API_ORIGIN = "http://wr-api.local";
+  global.fetch = async () => ({
+    ok: false,
+    async json() {
+      return { error: "chat_channel_forbidden" };
+    },
+  });
+
+  const { server, runtime } = createAppServer();
+
+  try {
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    const port = typeof address === "object" && address ? address.port : 0;
+    const sessionToken = createToken(1);
+
+    await new Promise((resolve, reject) => {
+      const ws = new WebSocket(
+        `ws://127.0.0.1:${port}/ws?sessionToken=${encodeURIComponent(sessionToken)}`,
+      );
+
+      ws.on("message", (message) => {
+        const payload = JSON.parse(String(message || ""));
+
+        try {
+          if (payload.type === "session:ready") {
+            ws.send(JSON.stringify({ type: "channel:join", channelId: "404" }));
+            return;
+          }
+
+          if (payload.type === "error") {
+            assert.equal(payload.error, "chat_channel_forbidden");
+            assert.equal(runtime.rooms.has("404"), false);
+            ws.close();
+            resolve();
+          }
+        } catch (error) {
+          reject(error);
+        }
+      });
+
+      ws.on("error", reject);
+    });
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+
+    if (previousSecret == null) {
+      delete process.env.WR_CHAT_SHARED_SECRET;
+    } else {
+      process.env.WR_CHAT_SHARED_SECRET = previousSecret;
+    }
+
+    if (previousApiOrigin == null) {
+      delete process.env.WR_API_ORIGIN;
+    } else {
+      process.env.WR_API_ORIGIN = previousApiOrigin;
+    }
+
+    global.fetch = previousFetch;
   }
 });
