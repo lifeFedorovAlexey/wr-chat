@@ -136,7 +136,9 @@ jobs:
                 exit 1
               fi
 
-              cp "${SITE_CONFIG}" "${SITE_CONFIG}.bak-wr-chat-${RELEASE_ID}"
+              NGINX_BACKUP_DIR="${SHARED_DIR}/nginx-backups"
+              mkdir -p "${NGINX_BACKUP_DIR}"
+              cp "${SITE_CONFIG}" "${NGINX_BACKUP_DIR}/$(basename "${SITE_CONFIG}").bak-wr-chat-${RELEASE_ID}"
               node - "${SITE_CONFIG}" <<'NODE'
             const fs = require("node:fs");
 
