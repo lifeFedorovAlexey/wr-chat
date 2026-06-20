@@ -130,7 +130,26 @@ jobs:
                 exit 1
               fi
 
-              SITE_CONFIG="$(grep -Rsl "server_name .*wildriftallstats\.ru" /etc/nginx/sites-enabled /etc/nginx/conf.d 2>/dev/null | head -n 1 || true)"
+              find /etc/nginx/sites-enabled /etc/nginx/conf.d \
+                -maxdepth 1 \
+                -type f \
+                -name "*.bak-wr-chat-*" \
+                -delete 2>/dev/null || true
+
+              SITE_CONFIG="$(
+                while IFS= read -r candidate; do
+                  if grep -q "server_name .*wildriftallstats\.ru" "$candidate" 2>/dev/null; then
+                    printf '%s\n' "$candidate"
+                    break
+                  fi
+                done < <(
+                  find /etc/nginx/sites-enabled /etc/nginx/conf.d \
+                    -maxdepth 1 \
+                    -type f \
+                    ! -name "*.bak-wr-chat-*" \
+                    -print 2>/dev/null | sort
+                )
+              )"
               if [ -z "${SITE_CONFIG}" ]; then
                 echo "nginx server block for wildriftallstats.ru was not found"
                 exit 1
