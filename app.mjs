@@ -7,7 +7,13 @@ import {
   verifyChatSessionToken,
   verifySignedChatExchangeEnvelope,
 } from "./lib/chatAuth.mjs";
-import { authorizeChatChannelAccess, persistChatMessage } from "./lib/wrApiClient.mjs";
+import {
+  authorizeChatChannelAccess,
+  deleteChatMessage,
+  moderateChatUser,
+  persistChatMessage,
+  WrApiClientError,
+} from "./lib/wrApiClient.mjs";
 
 function sendJson(res, statusCode, payload) {
   res.writeHead(statusCode, { "Content-Type": "application/json" });
@@ -129,6 +135,26 @@ function createWsRuntime() {
     },
     joinRoom,
     leaveRoom,
+    sendToUser(userId, payload) {
+      let delivered = 0;
+      const normalizedUserId = String(userId || "");
+      for (const client of clients.values()) {
+        if (String(client.session?.user?.id || "") !== normalizedUserId) continue;
+        client.ws.send(JSON.stringify(payload));
+        delivered += 1;
+      }
+      return delivered;
+    },
+    removeUserFromChannels(userId, channelIds) {
+      const normalizedUserId = String(userId || "");
+      const affected = new Set((channelIds || []).map((value) => String(value)));
+      for (const [memberClientId, client] of clients) {
+        if (String(client.session?.user?.id || "") !== normalizedUserId) continue;
+        for (const channelId of Array.from(client.channels)) {
+          if (affected.has(channelId)) leaveRoom(memberClientId, channelId);
+        }
+      }
+    },
     unregister(clientId) {
       leaveAllRooms(clientId);
       clients.delete(clientId);
@@ -219,6 +245,7 @@ async function handleSocketMessage(ws, runtime, clientId, rawMessage) {
         await authorizeChatChannelAccess(
           {
             userId: Number(client.session.user.id),
+            roles: client.session.user.roles,
             channelId: message.channelId,
           },
           process.env,
@@ -257,7 +284,10 @@ async function handleSocketMessage(ws, runtime, clientId, rawMessage) {
       }
 
       const body = String(message.body || "").trim();
-      if (!body) {
+      const attachmentIds = Array.isArray(message.attachmentIds)
+        ? message.attachmentIds.map((value) => Number(value || 0)).filter(Boolean)
+        : [];
+      if (!body && !attachmentIds.length) {
         ws.send(JSON.stringify({ type: "error", error: "message_body_required" }));
         return;
       }
@@ -265,8 +295,10 @@ async function handleSocketMessage(ws, runtime, clientId, rawMessage) {
       const persistedMessage = await persistChatMessage(
         {
           userId: Number(client.session.user.id),
+          roles: client.session.user.roles,
           channelId: Number(channelId),
           body,
+          attachmentIds,
         },
         process.env,
       );
@@ -276,11 +308,95 @@ async function handleSocketMessage(ws, runtime, clientId, rawMessage) {
         channelId,
         message: {
           ...(persistedMessage || {}),
-          author: client.session.user,
+          author: persistedMessage?.author || client.session.user,
         },
       };
 
       broadcastToRoom(runtime, channelId, event);
+      return;
+    }
+
+    if (type === "message:delete" && message.channelId && message.messageId) {
+      const channelId = String(message.channelId).trim();
+      const client = runtime.getClient(clientId);
+      if (!client || !client.channels.has(channelId)) {
+        ws.send(JSON.stringify({ type: "error", error: "channel_not_joined" }));
+        return;
+      }
+
+      const deleted = await deleteChatMessage(
+        {
+          userId: Number(client.session.user.id),
+          roles: client.session.user.roles,
+          messageId: Number(message.messageId),
+          reason: message.reason,
+        },
+        process.env,
+      );
+      broadcastToRoom(runtime, channelId, {
+        type: "message:deleted",
+        channelId,
+        messageId: Number(deleted?.messageId || message.messageId),
+        deletedAt: deleted?.deletedAt || new Date().toISOString(),
+      });
+      return;
+    }
+
+    if (type === "moderation:action") {
+      const client = runtime.getClient(clientId);
+      const roles = Array.isArray(client?.session?.user?.roles)
+        ? client.session.user.roles.map((role) => String(role).toLowerCase())
+        : [];
+      if (!client || !roles.includes("admin")) {
+        ws.send(JSON.stringify({ type: "error", error: "chat_admin_required" }));
+        return;
+      }
+
+      const result = await moderateChatUser(
+        {
+          actorUserId: Number(client.session.user.id),
+          actorRoles: roles,
+          action: message.action,
+          groupId: Number(message.groupId || 0),
+          targetUserId: Number(message.targetUserId || 0),
+          durationSeconds: Number(message.durationSeconds || 0),
+          reason: message.reason,
+        },
+        process.env,
+      );
+      const affectedChannelIds = (result?.affectedChannelIds || []).map((value) => String(value));
+
+      if (result?.action === "mute") {
+        runtime.sendToUser(result.targetUserId, {
+          type: "moderation:muted",
+          warning: "Администратор временно ограничил отправку сообщений.",
+          mute: result.mute,
+        });
+      } else if (result?.action === "unmute") {
+        runtime.sendToUser(result.targetUserId, {
+          type: "moderation:unmuted",
+          groupId: result.groupId,
+        });
+      } else if (result?.action === "ban" || result?.action === "kick") {
+        runtime.sendToUser(result.targetUserId, {
+          type: "moderation:removed",
+          action: result.action,
+          groupId: result.groupId,
+        });
+        runtime.removeUserFromChannels(result.targetUserId, affectedChannelIds);
+      }
+
+      for (const affectedChannelId of affectedChannelIds) {
+        broadcastToRoom(runtime, affectedChannelId, {
+          type: "moderation:update",
+          action: result?.action,
+          groupId: result?.groupId,
+          targetUserId: result?.targetUserId,
+        });
+        sendPresenceUpdate(runtime, affectedChannelId);
+      }
+
+      ws.send(JSON.stringify({ type: "moderation:ack", result }));
       return;
     }
 
@@ -308,10 +424,32 @@ async function handleSocketMessage(ws, runtime, clientId, rawMessage) {
 
     ws.send(JSON.stringify({ type: "error", error: "unsupported_event" }));
   } catch (error) {
+    if (
+      error instanceof WrApiClientError &&
+      (error.code === "chat_muted" || error.code === "chat_antispam_muted")
+    ) {
+      ws.send(
+        JSON.stringify({
+          type: "moderation:muted",
+          error: error.code,
+          warning:
+            error.payload?.warning ||
+            "Отправка сообщений временно ограничена.",
+          mute: error.payload?.mute || null,
+        }),
+      );
+      return;
+    }
+
     ws.send(
       JSON.stringify({
         type: "error",
-        error: error instanceof Error ? error.message : "invalid_message",
+        error:
+          error instanceof WrApiClientError
+            ? error.code
+            : error instanceof Error
+              ? error.message
+              : "invalid_message",
       }),
     );
   }
@@ -359,7 +497,7 @@ export function createAppServer() {
   });
 
   const runtime = createWsRuntime();
-  const wsServer = new WebSocketServer({ noServer: true });
+  const wsServer = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 });
 
   wsServer.on("connection", (ws, request, session) => {
     const clientId = runtime.register(ws, session);
